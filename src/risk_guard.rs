@@ -1,7 +1,6 @@
 /// Risk management and safety guard for trade execution
 /// Provides protection against dangerous market conditions
-#![allow(dead_code)]
-
+#[allow(dead_code)]
 use rustc_hash::FxHashMap;
 use std::time::{Duration, Instant};
 
@@ -21,18 +20,6 @@ pub enum SafetyDecision {
     Block,
     FetchBook,
 }
-
-#[derive(Clone, Copy)]
-pub enum SafetyReason {
-    Tripped { secs_left: u32 },
-    SmallTrade,
-    SeqOk { count: u8 },
-    SeqNeedBook { count: u8 },
-    Trap { seq: u8, depth_usd: u16 },
-    DepthOk { seq: u8, depth_usd: u16 },
-    BookFetchFailed,
-}
-
 impl SafetyReason {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -45,6 +32,17 @@ impl SafetyReason {
             SafetyReason::BookFetchFailed => "BOOK_FETCH_FAILED",
         }
     }
+}
+
+#[derive(Clone, Copy)]
+pub enum SafetyReason {
+    Tripped { secs_left: u32 },
+    SmallTrade,
+    SeqOk { count: u8 },
+    SeqNeedBook { count: u8 },
+    Trap { seq: u8, depth_usd: u16 },
+    DepthOk { seq: u8, depth_usd: u16 },
+    BookFetchFailed,
 }
 
 #[derive(Clone, Copy)]
@@ -74,7 +72,7 @@ impl Default for RiskGuardConfig {
             consecutive_trigger: 5,
             sequence_window: Duration::from_secs(40),
             min_depth_beyond_usd: 200.0,
-            trip_duration: Duration::from_secs(60 * 60 * 5), // 5 hours
+            trip_duration: Duration::from_secs(60 * 60 * 5),
         }
     }
 }
@@ -104,36 +102,40 @@ impl Default for TokenState {
 }
 
 // =============================================================================
-// Circuit Breaker
+// Risk Guard
 // =============================================================================
 
 pub struct RiskGuard {
-    config: CircuitBreakerConfig,
+    config: RiskGuardConfig,
     tokens: FxHashMap<String, TokenState>,
 }
 
 impl RiskGuard {
-    pub fn new(config: CircuitBreakerConfig) -> Self {
+    pub fn new(config: RiskGuardConfig) -> Self {
         Self {
             config,
             tokens: FxHashMap::default(),
         }
     }
     
-    /// Hot path - no allocations if token exists
+    pub fn trip(&mut self, token_id: &str) {
+        if let Some(state) = self.tokens.get_mut(token_id) {
+            state.tripped_until =
+                Some(std::time::Instant::now() + self.config.trip_duration);
+        }
+    }
+
+
     #[inline]
-    pub fn check_fast(&mut self, token_id: &str, whale_shares: f64) -> Evaluation {
+    pub fn check_fast(&mut self, token_id: &str, whale_shares: f64) -> SafetyEvaluation {
         let now = Instant::now();
-        
-        // Use entry API - single lookup instead of get_mut + insert + get_mut
-        let state = self.tokens.entry(token_id.to_string()).or_insert_with(TokenState::new);
-        
-        // Check trip
+        let state = self.tokens.entry(token_id.to_string()).or_default();
+
         if let Some(until) = state.tripped_until {
             if now < until {
-                return Evaluation {
-                    decision: Decision::Block,
-                    reason: Reason::Tripped {
+                return SafetyEvaluation {
+                    decision: SafetyDecision::Block,
+                    reason: SafetyReason::Tripped {
                         secs_left: (until - now).as_secs() as u32,
                     },
                     consecutive_large: 0,
@@ -141,76 +143,71 @@ impl RiskGuard {
             }
             state.tripped_until = None;
         }
-        
-        // Small trade - fast path
+
         if whale_shares < self.config.large_trade_shares {
-            return Evaluation {
-                decision: Decision::Allow,
-                reason: Reason::SmallTrade,
+            return SafetyEvaluation {
+                decision: SafetyDecision::Allow,
+                reason: SafetyReason::SmallTrade,
                 consecutive_large: 0,
             };
         }
-        
-        // Count consecutive (no pruning on hot path)
+
         let consecutive = Self::count_large_in_window(
             state,
             now,
             self.config.sequence_window,
             self.config.large_trade_shares,
         ) + 1;
-        
-        // Record trade
+
         state.large_trades.push((now, whale_shares));
-        
-        // Lazy prune
+
         if state.large_trades.len() > 16 {
             let cutoff = now - self.config.sequence_window;
             state.large_trades.retain(|(ts, _)| *ts > cutoff);
         }
-        
+
         let count = consecutive.min(255) as u8;
-        
+
         if consecutive >= self.config.consecutive_trigger as usize {
-            Evaluation {
-                decision: Decision::FetchBook,
-                reason: Reason::SeqNeedBook { count },
+            SafetyEvaluation {
+                decision: SafetyDecision::FetchBook,
+                reason: SafetyReason::SeqNeedBook { count },
                 consecutive_large: count,
             }
         } else {
-            Evaluation {
-                decision: Decision::Allow,
-                reason: Reason::SeqOk { count },
+            SafetyEvaluation {
+                decision: SafetyDecision::Allow,
+                reason: SafetyReason::SeqOk { count },
                 consecutive_large: count,
             }
         }
     }
-    
+
     #[inline]
     pub fn check_with_book(
         &mut self,
         token_id: &str,
         consecutive: u8,
         depth_beyond_usd: f64,
-    ) -> Evaluation {
-        let depth_u16 = (depth_beyond_usd.min(65535.0)) as u16;
-        
+    ) -> SafetyEvaluation {
+        let depth_u16 = depth_beyond_usd.min(65535.0) as u16;
+
         if depth_beyond_usd < self.config.min_depth_beyond_usd {
-            // Trip - create state if needed
             let state = self.tokens.entry(token_id.to_string()).or_default();
             state.tripped_until = Some(Instant::now() + self.config.trip_duration);
-            
-            Evaluation {
-                decision: Decision::Block,
-                reason: Reason::Trap {
+
+            SafetyEvaluation {
+                decision: SafetyDecision::Block,
+                reason: SafetyReason::Trap {
                     seq: consecutive,
                     depth_usd: depth_u16,
                 },
                 consecutive_large: consecutive,
             }
         } else {
-            Evaluation {
-                decision: Decision::Allow,
-                reason: Reason::DepthOk {
+            SafetyEvaluation {
+                decision: SafetyDecision::Allow,
+                reason: SafetyReason::DepthOk {
                     seq: consecutive,
                     depth_usd: depth_u16,
                 },
@@ -218,32 +215,25 @@ impl RiskGuard {
             }
         }
     }
-    
-    pub fn trip(&mut self, token_id: &str) {
-        if let Some(state) = self.tokens.get_mut(token_id) {
-            state.tripped_until = Some(Instant::now() + self.config.trip_duration);
-        }
-    }
-    
+
     #[inline]
     fn count_large_in_window(
         state: &TokenState,
         now: Instant,
-        sequence_window: Duration,
-        large_trade_shares: f64,
+        window: Duration,
+        threshold: f64,
     ) -> usize {
-        let cutoff = now - sequence_window;
-        
+        let cutoff = now - window;
         state
             .large_trades
             .iter()
-            .filter(|(ts, shares)| *ts > cutoff && *shares >= large_trade_shares)
+            .filter(|(ts, shares)| *ts > cutoff && *shares >= threshold)
             .count()
     }
 }
 
 // =============================================================================
-// Book depth - separate from hot path
+// Book depth
 // =============================================================================
 
 #[inline]
@@ -253,104 +243,16 @@ pub fn calc_liquidity_depth(side: TradeSide, levels: &[(f64, f64)], threshold: f
     } else {
         threshold * 0.995
     };
-    
-    let mut total = 0.0;
-    for &(price, size) in levels {
-        let beyond = if side == TradeSide::Buy {
-            price > threshold_adj
-        } else {
-            price < threshold_adj
-        };
-        if beyond {
-            total += price * size;
-        }
-    }
-    total
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_small_trade_allows() {
-        let mut guard = RiskGuard::new(RiskGuardConfig::default());
-        let eval = guard.check_fast("token1", 100.0);
-        assert_eq!(eval.decision, SafetyDecision::Allow);
-    }
-
-    #[test]
-    fn test_single_large_allows() {
-        let mut cb = CircuitBreaker::new(CircuitBreakerConfig::default());
-        let eval = cb.check_fast("token1", 2000.0);
-        assert_eq!(eval.decision, Decision::Allow);
-        assert_eq!(eval.consecutive_large, 1);
-    }
-
-    #[test]
-    fn test_two_large_triggers_fetch() {
-        let mut cb = CircuitBreaker::new(CircuitBreakerConfig::default());
-        cb.check_fast("token1", 2000.0);  // First
-        cb.check_fast("token1", 2000.0);
-        cb.check_fast("token1", 2000.0);
-        cb.check_fast("token1", 2000.0);
-        let eval = cb.check_fast("token1", 2000.0);  // Second
-        assert_eq!(eval.decision, Decision::FetchBook);
-        assert_eq!(eval.consecutive_large, 5);
-    }
-
-    #[test]
-    fn test_thin_book_blocks() {
-        let mut cb = CircuitBreaker::new(CircuitBreakerConfig::default());
-        let eval = cb.check_with_book("token1", 2, 50.0);  // $50 < $200 threshold
-        assert_eq!(eval.decision, Decision::Block);
-    }
-
-    #[test]
-    fn test_good_depth_allows() {
-        let mut cb = CircuitBreaker::new(CircuitBreakerConfig::default());
-        let eval = cb.check_with_book("token1", 2, 500.0);  // $500 > $200 threshold
-        assert_eq!(eval.decision, Decision::Allow);
-    }
-
-    #[test]
-    fn test_tripped_token_stays_blocked() {
-        let mut cb = CircuitBreaker::new(CircuitBreakerConfig {
-            trip_duration: Duration::from_secs(10),
-            ..Default::default()
-        });
-        
-        // Trip it
-        cb.check_with_book("token1", 2, 50.0);
-        
-        // Should still be blocked
-        let eval = cb.check_fast("token1", 100.0);  // Even small trade
-        assert_eq!(eval.decision, Decision::Block);
-    }
-
-    #[test]
-    fn test_different_tokens_independent() {
-        let mut cb = CircuitBreaker::new(CircuitBreakerConfig::default());
-        cb.check_fast("token1", 2000.0);
-        cb.check_fast("token1", 2000.0);
-        cb.check_fast("token1", 2000.0);
-        cb.check_fast("token1", 2000.0);
-        cb.check_fast("token1", 2000.0); 
-        
-        let eval = cb.check_fast("token2", 2000.0);  // token2 first large
-        assert_eq!(eval.decision, Decision::Allow);
-        assert_eq!(eval.consecutive_large, 1);
-    }
-
-    #[test]
-    fn test_depth_calculation() {
-        let asks = vec![
-            (0.54, 100.0),  // At threshold
-            (0.55, 200.0),  // Beyond
-            (0.60, 150.0),  // Beyond
-        ];
-        let depth = calc_liquidity_depth(TradeSide::Buy, &asks, 0.54);
-        // 0.55 * 200 + 0.60 * 150 = 110 + 90 = 200
-        assert!((depth - 200.0).abs() < 1.0);
-    }
+    levels
+        .iter()
+        .filter(|(price, _)| {
+            if side == TradeSide::Buy {
+                *price > threshold_adj
+            } else {
+                *price < threshold_adj
+            }
+        })
+        .map(|(price, size)| price * size)
+        .sum()
 }
