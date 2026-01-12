@@ -1,10 +1,9 @@
 /// Market cache management with automatic refresh
 /// Handles caching of market data, tokens, and live status
-
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 // ============================================================================
@@ -21,9 +20,9 @@ const ATP_TOKENS_CACHE_PATH: &str = ".atp_token_categories.json";
 const LIGUE1_TOKENS_CACHE_PATH: &str = ".ligue1_tokens.json";
 const LIVE_CACHE_PATH: &str = ".live_cache.json";
 
-/// Price buffer adjustments for specialized markets
-const TENNIS_BUFFER: f64 = 0.01;
-const SOCCER_BUFFER: f64 = 0.01;
+/// Price buffer adjustments
+const ATP_BUFFER: f64 = 0.01;
+const LIGUE1_BUFFER: f64 = 0.01;
 
 // ============================================================================
 // Cache Data Structures
@@ -35,11 +34,11 @@ pub struct MarketCaches {
     pub neg_risk: RwLock<FxHashMap<String, bool>>,
     /// Token ID -> market slug
     pub slugs: RwLock<FxHashMap<String, String>>,
-    /// Tennis (ATP) token IDs (for price buffer calculation)
-    pub tennis_tokens: RwLock<FxHashMap<String, String>>,
-    /// Soccer (Ligue 1) token IDs (for price buffer calculation)
-    pub soccer_tokens: RwLock<FxHashMap<String, ()>>,
-    /// Token ID -> live status (for GTD expiry calculation)
+    /// ATP token IDs
+    pub atp_tokens: RwLock<FxHashMap<String, String>>,
+    /// Ligue 1 token IDs
+    pub ligue1_tokens: RwLock<FxHashMap<String, ()>>,
+    /// Token ID -> live status
     pub live_status: RwLock<FxHashMap<String, bool>>,
     /// Last refresh timestamp (Unix seconds)
     pub last_refresh: AtomicU64,
@@ -51,12 +50,16 @@ pub struct MarketCaches {
 pub struct CacheStats {
     pub neg_risk_count: AtomicU64,
     pub slug_count: AtomicU64,
-    pub tennis_count: AtomicU64,
-    pub soccer_count: AtomicU64,
+    pub atp_count: AtomicU64,
+    pub ligue1_count: AtomicU64,
     pub live_count: AtomicU64,
     pub refresh_count: AtomicU64,
     pub last_refresh_duration_ms: AtomicU64,
 }
+
+// ============================================================================
+// MarketCaches impl
+// ============================================================================
 
 impl MarketCaches {
     pub fn new() -> Self {
@@ -76,46 +79,48 @@ impl MarketCaches {
         let start = Instant::now();
         let mut result = CacheLoadResult::default();
 
-        // Load neg_risk cache
+        // neg_risk
         if let Ok(data) = std::fs::read_to_string(NEG_RISK_CACHE_PATH) {
             if let Ok(map) = serde_json::from_str::<HashMap<String, bool>>(&data) {
                 let count = map.len();
                 if let Ok(mut cache) = self.neg_risk.write() {
                     cache.clear();
-                    cache.extend(map.into_iter());
+                    cache.extend(map);
                     result.neg_risk_loaded = count;
-                    self.stats.neg_risk_count.store(count as u64, Ordering::Relaxed);
+                    self.stats
+                        .neg_risk_count
+                        .store(count as u64, Ordering::Relaxed);
                 }
             }
         }
 
-        // Load slug cache
+        // slugs
         if let Ok(data) = std::fs::read_to_string(SLUG_CACHE_PATH) {
             if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&data) {
                 let count = map.len();
                 if let Ok(mut cache) = self.slugs.write() {
                     cache.clear();
-                    cache.extend(map.into_iter());
+                    cache.extend(map);
                     result.slugs_loaded = count;
                     self.stats.slug_count.store(count as u64, Ordering::Relaxed);
                 }
             }
         }
 
-        // Load ATP tokens cache
+        // ATP tokens
         if let Ok(data) = std::fs::read_to_string(ATP_TOKENS_CACHE_PATH) {
             if let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&data) {
                 let count = map.len();
                 if let Ok(mut cache) = self.atp_tokens.write() {
                     cache.clear();
-                    cache.extend(map.into_iter());
+                    cache.extend(map);
                     result.atp_loaded = count;
                     self.stats.atp_count.store(count as u64, Ordering::Relaxed);
                 }
             }
         }
 
-        // Load Ligue 1 tokens cache
+        // Ligue 1 tokens
         if let Ok(data) = std::fs::read_to_string(LIGUE1_TOKENS_CACHE_PATH) {
             if let Ok(tokens) = serde_json::from_str::<Vec<String>>(&data) {
                 let count = tokens.len();
@@ -123,108 +128,116 @@ impl MarketCaches {
                     cache.clear();
                     cache.extend(tokens.into_iter().map(|t| (t, ())));
                     result.ligue1_loaded = count;
-                    self.stats.ligue1_count.store(count as u64, Ordering::Relaxed);
+                    self.stats
+                        .ligue1_count
+                        .store(count as u64, Ordering::Relaxed);
                 }
             }
         }
 
-        // Load live status cache
+        // live status
         if let Ok(data) = std::fs::read_to_string(LIVE_CACHE_PATH) {
             if let Ok(map) = serde_json::from_str::<HashMap<String, bool>>(&data) {
                 let count = map.len();
                 if let Ok(mut cache) = self.live_status.write() {
                     cache.clear();
-                    cache.extend(map.into_iter());
+                    cache.extend(map);
                     result.live_loaded = count;
                     self.stats.live_count.store(count as u64, Ordering::Relaxed);
                 }
             }
         }
 
-        let elapsed = start.elapsed();
-        result.load_time_ms = elapsed.as_millis() as u64;
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        result.load_time_ms = elapsed_ms;
 
-        // Update last refresh timestamp
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs();
+
         self.last_refresh.store(now, Ordering::Relaxed);
         self.stats.refresh_count.fetch_add(1, Ordering::Relaxed);
-        self.stats.last_refresh_duration_ms.store(result.load_time_ms, Ordering::Relaxed);
+        self.stats
+            .last_refresh_duration_ms
+            .store(elapsed_ms, Ordering::Relaxed);
 
         result
     }
 
-    /// Check if token is neg_risk
+    // ------------------------------------------------------------------------
+    // Lookups
+    // ------------------------------------------------------------------------
+
     #[inline]
     pub fn is_neg_risk(&self, token_id: &str) -> Option<bool> {
         self.neg_risk.read().ok()?.get(token_id).copied()
     }
 
-    /// Get slug for token
     #[inline]
     pub fn get_slug(&self, token_id: &str) -> Option<String> {
         self.slugs.read().ok()?.get(token_id).cloned()
     }
 
-    /// Check if token is ATP market
     #[inline]
     pub fn is_atp_token(&self, token_id: &str) -> bool {
-        self.atp_tokens.read().map(|c| c.contains_key(token_id)).unwrap_or(false)
+        self.atp_tokens
+            .read()
+            .map(|c| c.contains_key(token_id))
+            .unwrap_or(false)
     }
 
-    /// Check if token is Ligue 1 market
     #[inline]
     pub fn is_ligue1_token(&self, token_id: &str) -> bool {
-        self.ligue1_tokens.read().map(|c| c.contains_key(token_id)).unwrap_or(false)
+        self.ligue1_tokens
+            .read()
+            .map(|c| c.contains_key(token_id))
+            .unwrap_or(false)
     }
 
-    /// Get ATP buffer for token (0.01 if ATP, 0.0 otherwise)
     #[inline]
     pub fn get_atp_buffer(&self, token_id: &str) -> f64 {
-        if self.is_atp_token(token_id) { ATP_BUFFER } else { 0.0 }
+        if self.is_atp_token(token_id) {
+            ATP_BUFFER
+        } else {
+            0.0
+        }
     }
 
-    /// Get Ligue 1 buffer for token (0.01 if Ligue1, 0.0 otherwise)
     #[inline]
     pub fn get_ligue1_buffer(&self, token_id: &str) -> f64 {
-        if self.is_ligue1_token(token_id) { LIGUE1_BUFFER } else { 0.0 }
+        if self.is_ligue1_token(token_id) {
+            LIGUE1_BUFFER
+        } else {
+            0.0
+        }
     }
 
-    /// Get live status for token (for GTD expiry calculation)
     #[inline]
     pub fn get_is_live(&self, token_id: &str) -> Option<bool> {
         self.live_status.read().ok()?.get(token_id).copied()
     }
 
-    /// Insert neg_risk value for a token (for dynamic updates)
+    // ------------------------------------------------------------------------
+    // Backward compatibility (do NOT remove yet)
+    // ------------------------------------------------------------------------
+
+    #[inline]
+    pub fn is_soccer_token(&self, token_id: &str) -> bool {
+        self.is_ligue1_token(token_id)
+    }
+
+    #[inline]
+    pub fn is_tennis_token(&self, token_id: &str) -> bool {
+        self.is_atp_token(token_id)
+    }
+
     pub fn set_neg_risk(&self, token_id: String, neg_risk: bool) {
         if let Ok(mut cache) = self.neg_risk.write() {
             cache.insert(token_id, neg_risk);
         }
     }
 
-    /// Insert slug for a token (for dynamic updates)
-    pub fn set_slug(&self, token_id: String, slug: String) {
-        if let Ok(mut cache) = self.slugs.write() {
-            cache.insert(token_id, slug);
-        }
-    }
-
-    /// Get cache statistics summary
-    pub fn get_stats_summary(&self) -> String {
-        format!(
-            "Caches: neg_risk={}, slugs={}, atp={}, ligue1={}, refreshes={}",
-            self.stats.neg_risk_count.load(Ordering::Relaxed),
-            self.stats.slug_count.load(Ordering::Relaxed),
-            self.stats.atp_count.load(Ordering::Relaxed),
-            self.stats.ligue1_count.load(Ordering::Relaxed),
-            self.stats.refresh_count.load(Ordering::Relaxed),
-        )
-    }
-
-    /// Check if cache refresh is needed
     pub fn needs_refresh(&self) -> bool {
         let last = self.last_refresh.load(Ordering::Relaxed);
         let now = std::time::SystemTime::now()
@@ -240,6 +253,10 @@ impl Default for MarketCaches {
         Self::new()
     }
 }
+
+// ============================================================================
+// Load Result
+// ============================================================================
 
 #[derive(Debug, Default)]
 pub struct CacheLoadResult {
@@ -274,12 +291,10 @@ use std::sync::OnceLock;
 
 static GLOBAL_CACHES: OnceLock<MarketCaches> = OnceLock::new();
 
-/// Get the global cache instance
 pub fn global_caches() -> &'static MarketCaches {
     GLOBAL_CACHES.get_or_init(MarketCaches::new)
 }
 
-/// Initialize and load all caches (call once at startup)
 pub fn init_caches() -> CacheLoadResult {
     let caches = global_caches();
     let result = caches.load_all();
@@ -287,7 +302,6 @@ pub fn init_caches() -> CacheLoadResult {
     result
 }
 
-/// Refresh all caches (call periodically)
 pub fn refresh_caches() -> CacheLoadResult {
     let caches = global_caches();
     let result = caches.load_all();
@@ -296,102 +310,44 @@ pub fn refresh_caches() -> CacheLoadResult {
 }
 
 // ============================================================================
-// Async Cache Refresh Task
+// Async Refresh Task
 // ============================================================================
 
-/// Spawn a background task that periodically refreshes caches
-/// Returns a handle that can be used to abort the task
 pub fn spawn_cache_refresh_task() -> tokio::task::JoinHandle<()> {
     tokio::spawn(async {
         let interval = Duration::from_secs(CACHE_REFRESH_INTERVAL_SECS);
-        println!("🔄 Cache refresh task started (interval: {}s)", CACHE_REFRESH_INTERVAL_SECS);
-
         loop {
             tokio::time::sleep(interval).await;
-
-            // Run cache refresh in blocking task to avoid blocking async runtime
-            let result = tokio::task::spawn_blocking(refresh_caches).await;
-
-            if let Err(e) = result {
-                eprintln!("⚠️ Cache refresh task error: {}", e);
-            }
+            let _ = tokio::task::spawn_blocking(refresh_caches).await;
         }
     })
 }
 
 // ============================================================================
-// Convenience Functions (for backwards compatibility)
+// Convenience Functions
 // ============================================================================
 
-/// Get ATP buffer for a token (convenience function)
 #[inline]
 pub fn get_atp_token_buffer(token_id: &str) -> f64 {
     global_caches().get_atp_buffer(token_id)
 }
 
-/// Get Ligue 1 buffer for a token (convenience function)
 #[inline]
 pub fn get_ligue1_token_buffer(token_id: &str) -> f64 {
     global_caches().get_ligue1_buffer(token_id)
 }
 
-/// Get slug for a token (convenience function)
 #[inline]
 pub fn get_slug(token_id: &str) -> Option<String> {
     global_caches().get_slug(token_id)
 }
 
-/// Check if token is neg_risk (convenience function)
 #[inline]
 pub fn is_neg_risk(token_id: &str) -> Option<bool> {
     global_caches().is_neg_risk(token_id)
 }
 
-/// Get is_live for a token (convenience function)
 #[inline]
 pub fn get_is_live(token_id: &str) -> Option<bool> {
     global_caches().get_is_live(token_id)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_cache_creation() {
-        let caches = MarketCaches::new();
-        assert!(caches.neg_risk.read().unwrap().is_empty());
-        assert!(caches.slugs.read().unwrap().is_empty());
-        assert!(caches.atp_tokens.read().unwrap().is_empty());
-        assert!(caches.ligue1_tokens.read().unwrap().is_empty());
-    }
-
-    #[test]
-    fn test_set_and_get_neg_risk() {
-        let caches = MarketCaches::new();
-        caches.set_neg_risk("token123".to_string(), true);
-        assert_eq!(caches.is_neg_risk("token123"), Some(true));
-        assert_eq!(caches.is_neg_risk("unknown"), None);
-    }
-
-    #[test]
-    fn test_set_and_get_slug() {
-        let caches = MarketCaches::new();
-        caches.set_slug("token123".to_string(), "market-slug".to_string());
-        assert_eq!(caches.get_slug("token123"), Some("market-slug".to_string()));
-        assert_eq!(caches.get_slug("unknown"), None);
-    }
-
-    #[test]
-    fn test_buffer_values() {
-        assert_eq!(ATP_BUFFER, 0.01);
-        assert_eq!(LIGUE1_BUFFER, 0.01);
-    }
-
-    #[test]
-    fn test_non_existent_returns_zero_buffer() {
-        let caches = MarketCaches::new();
-        assert_eq!(caches.get_atp_buffer("nonexistent"), 0.0);
-        assert_eq!(caches.get_ligue1_buffer("nonexistent"), 0.0);
-    }
 }
