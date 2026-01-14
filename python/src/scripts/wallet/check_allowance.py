@@ -169,7 +169,7 @@ async def check_and_set_allowance():
             signed_txn = account.sign_transaction(approve_txn)
             
             # Send transaction
-            tx_hash = w3.eth.send_raw_transaction(signed_txn.rawTransaction)
+            tx_hash = w3.eth.send_raw_transaction(signed_txn.raw_transaction)
             print(f'Transaction sent: {tx_hash.hex()}')
             print('Waiting for confirmation...\n')
             
