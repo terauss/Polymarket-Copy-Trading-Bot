@@ -8,6 +8,7 @@ use alloy::primitives::U256;
 use futures::{SinkExt, StreamExt};
 use rand::Rng;
 use pm_whale_follower::{ApiCreds, OrderArgs, RustClobClient, PreparedCreds, OrderResponse};
+use pm_whale_follower::settings::Config;
 use serde_json::Value;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -87,7 +88,7 @@ async fn main() -> Result<()> {
     // Start background cache refresh task
     let _cache_refresh_handle = market_cache::spawn_cache_refresh_task();
 
-    let cfg = Settings::from_env()?;
+    let cfg = Config::from_env().await?;
     
     let (client, creds) = build_worker_state(
         cfg.private_key.clone(),
@@ -138,28 +139,7 @@ async fn build_worker_state(
     cache_path: &str,
     creds_path: &str,
 ) -> Result<(RustClobClient, ApiCreds)> {
-    let cache_path = cache_path.to_string();
-    let creds_path = creds_path.to_string();
-    let host = CLOB_API_BASE.to_string();
-
-    tokio::task::spawn_blocking(move || -> Result<(RustClobClient, ApiCreds)> {
-        let mut client = RustClobClient::new(&host, 137, &private_key, &funder)?
-            .with_cache_path(&cache_path);
-        let _ = client.load_cache();
-        
-        let _ = client.prewarm_connections();
-
-        let creds: ApiCreds = if Path::new(&creds_path).exists() {
-            let data = std::fs::read_to_string(&creds_path)?;
-            serde_json::from_str(&data)?
-        } else {
-            let derived = client.derive_api_key(0)?;
-            std::fs::write(&creds_path, serde_json::to_string_pretty(&derived)?)?;
-            derived
-        };
-
-        Ok((client, creds))
-    }).await?
+ 
 }
 
 fn start_order_worker(
@@ -171,10 +151,7 @@ fn start_order_worker(
     risk_config: RiskGuardConfig,
     resubmit_tx: mpsc::UnboundedSender<ResubmitRequest>,
 ) {
-    std::thread::spawn(move || {
-        let mut guard = RiskGuard::new(risk_config);
-        order_worker(rx, client, creds, enable_trading, mock_trading, &mut guard, resubmit_tx);
-    });
+    
 }
 
 fn order_worker(
@@ -186,11 +163,7 @@ fn order_worker(
     guard: &mut RiskGuard,
     resubmit_tx: mpsc::UnboundedSender<ResubmitRequest>,
 ) {
-    let mut client_mut = (*client).clone();
-    while let Some(work) = rx.blocking_recv() {
-        let status = process_order(&work.event.order, &mut client_mut, &creds, enable_trading, mock_trading, guard, &resubmit_tx, work.is_live);
-        let _ = work.respond_to.send(status);
-    }
+    
 }
 
 // ============================================================================
@@ -207,192 +180,11 @@ fn process_order(
     resubmit_tx: &mpsc::UnboundedSender<ResubmitRequest>,
     is_live: Option<bool>,
 ) -> String {
-    if !enable_trading { return "SKIPPED_DISABLED".into(); }
-    if mock_trading { return "MOCK_ONLY".into(); }
-
-    let side_is_buy = info.order_type.starts_with("BUY");
-    let whale_shares = info.shares;
-    let whale_price = info.price_per_share;
-
-    // Skip small trades to avoid negative expected value after fees
-    if should_skip_trade(whale_shares) {
-        return format!("SKIPPED_SMALL (<{:.0} shares)", MIN_WHALE_SHARES_TO_COPY);
-    }
-
-    // Risk guard safety check
-    let eval = guard.check_fast(&info.clob_token_id, whale_shares);
-    match eval.decision {
-        SafetyDecision::Block => return format!("RISK_BLOCKED:{}", eval.reason.as_str()),
-        SafetyDecision::FetchBook => {
-            let side = if side_is_buy { TradeSide::Buy } else { TradeSide::Sell };
-            match fetch_book_depth_blocking(client, &info.clob_token_id, side, whale_price) {
-                Ok(depth) => {
-                    let final_eval = guard.check_with_book(&info.clob_token_id, eval.consecutive_large, depth);
-                    if final_eval.decision == SafetyDecision::Block {
-                        return format!("RISK_BLOCKED:{}", final_eval.reason.as_str());
-                    }
-                }
-                Err(e) => {
-                    guard.trip(&info.clob_token_id);
-                    return format!("RISK_BOOK_FAIL:{e}");
-                }
-            }
-        }
-        SafetyDecision::Allow => {}
-    }
-
-    let (buffer, order_action, size_multiplier) = get_tier_params(whale_shares, side_is_buy, &info.clob_token_id);
-
-    // Polymarket valid price range: 0.01 to 0.99 (tick size 0.01)
-    let limit_price = if side_is_buy {
-        (whale_price + buffer).min(0.99)
-    } else {
-        (whale_price - buffer).max(0.01)
-    };
-
-    let (my_shares, size_type) = calculate_safe_size(whale_shares, limit_price, size_multiplier);
-    if my_shares == 0.0 {
-        return format!("SKIPPED_PROBABILITY ({})", size_type);
-    }
-    
-    let args = OrderArgs {
-        token_id: info.clob_token_id.to_string(),  
-        price: limit_price,
-        size: (my_shares * 100.0).floor() / 100.0,  
-        side: if side_is_buy { "BUY".into() } else { "SELL".into() },
-        fee_rate_bps: None,
-        nonce: Some(0),
-        expiration: Some("0".into()),
-        taker: None,
-        order_type: Some(order_action.to_string()),
-    };
-
-    match client.create_order(args).and_then(|signed| {
-        let body = signed.post_body(&creds.api_key, order_action);
-        client.post_order_fast(body, creds)
-    }) {
-        Ok(resp) => {
-            let status = resp.status();
-            let body_text = resp.text().unwrap_or_default();
-
-            let order_resp: Option<OrderResponse> = if status.is_success() {
-                serde_json::from_str(&body_text).ok()
-            } else {
-                None
-            };
-
-            let mut underfill_msg: Option<String> = None;
-            if let Some(ref resp) = order_resp {
-                if side_is_buy && order_action == "FAK" {
-                    let filled_shares: f64 = resp.taking_amount.parse().unwrap_or(0.0);
-                    let requested_shares = (my_shares * 100.0).floor() / 100.0;
-
-                    if filled_shares < requested_shares && filled_shares > 0.0 {
-                        let remaining_shares = requested_shares - filled_shares;
-
-                        let min_threshold = MIN_SHARE_COUNT.max(MIN_CASH_VALUE / limit_price);
-                        if remaining_shares >= min_threshold {
-                            let resubmit_buffer = get_resubmit_max_buffer(whale_shares);
-                            let max_price = (limit_price + resubmit_buffer).min(0.99);
-                            let req = ResubmitRequest {
-                                token_id: info.clob_token_id.to_string(),
-                                whale_price,
-                                failed_price: limit_price,  // Start at same price (already filled some)
-                                size: (remaining_shares * 100.0).floor() / 100.0,
-                                whale_shares,
-                                side_is_buy: true,
-                                attempt: 1,
-                                max_price,
-                                cumulative_filled: filled_shares,
-                                original_size: requested_shares,
-                                is_live: is_live.unwrap_or(false),
-                            };
-                            let _ = resubmit_tx.send(req);
-                            underfill_msg = Some(format!(
-                                " | \x1b[33mUNDERFILL: {:.2}/{:.2} filled, resubmit {:.2}\x1b[0m",
-                                filled_shares, my_shares, remaining_shares
-                            ));
-                        }
-                    }
-                }
-            }
-
-            if status.as_u16() == 400 && body_text.contains("FAK") && side_is_buy {
-                let resubmit_buffer = get_resubmit_max_buffer(whale_shares);
-                let max_price = (limit_price + resubmit_buffer).min(0.99);
-                let rounded_size = (my_shares * 100.0).floor() / 100.0;
-                let req = ResubmitRequest {
-                    token_id: info.clob_token_id.to_string(),
-                    whale_price,
-                    failed_price: limit_price,
-                    size: rounded_size,
-                    whale_shares,
-                    side_is_buy: true,
-                    attempt: 1,
-                    max_price,
-                    cumulative_filled: 0.0,
-                    original_size: rounded_size,
-                    is_live: is_live.unwrap_or(false),
-                };
-                let _ = resubmit_tx.send(req);
-            }
-
-            // Extract filled shares and actual fill price for display (reuse parsed response)
-            let (filled_shares, actual_fill_price) = order_resp.as_ref()
-                .and_then(|r| {
-                    let taking: f64 = r.taking_amount.parse().ok()?;
-                    let making: f64 = r.making_amount.parse().ok()?;
-                    if taking > 0.0 { Some((taking, making / taking)) } else { None }
-                })
-                .unwrap_or_else(|| {
-                    if status.is_success() { (my_shares, limit_price) } else { (0.0, limit_price) }
-                });
-
-            // Format with color-coded fill percentage
-            let pink = "\x1b[38;5;199m";
-            let reset = "\x1b[0m";
-            let fill_color = get_fill_color(filled_shares, my_shares);
-            let whale_color = get_whale_size_color(whale_shares);
-            let status_str = if status.is_success() { "200 OK" } else { "FAILED" };
-            let mut base = format!(
-                "{} [{}] | {}{:.2}/{:.2}{} filled @ {}{:.2}{} | {}whale {:.1}{} @ {:.2}",
-                status_str, size_type, fill_color, filled_shares, my_shares, reset, pink, actual_fill_price, reset, whale_color, whale_shares, reset, whale_price
-            );
-            if let Some(msg) = underfill_msg {
-                base.push_str(&msg);
-            }
-            if !status.is_success() {
-                base.push_str(&format!(" | {}", body_text));
-            }
-            base
-        }
-        Err(e) => {
-            let chain: Vec<_> = e.chain().map(|c| c.to_string()).collect();
-            format!("EXEC_FAIL: {} | chain: {}", e, chain.join(" -> "))
-        }
-    }
+   
 }
 
 fn calculate_safe_size(whale_shares: f64, price: f64, size_multiplier: f64) -> (f64, SizeType) {
-    let target_scaled = whale_shares * SCALING_RATIO * size_multiplier;
-    let safe_price = price.max(0.0001);
-    let required_floor = (MIN_CASH_VALUE / safe_price).max(MIN_SHARE_COUNT);
-
-    if target_scaled >= required_floor {
-        return (target_scaled, SizeType::Scaled);
-    }
-
-    if !USE_PROBABILISTIC_SIZING {
-        return (required_floor, SizeType::Scaled);
-    }
-
-    let probability = target_scaled / required_floor;
-    let pct = (probability * 100.0) as u8;
-    if rand::thread_rng().r#gen::<f64>() < probability {
-        (required_floor, SizeType::ProbHit(pct))
-    } else {
-        (0.0, SizeType::ProbSkip(pct))
-    }
+    
 }
 
 /// Get ANSI color code based on fill percentage

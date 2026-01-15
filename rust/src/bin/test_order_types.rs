@@ -8,7 +8,7 @@
 
 use anyhow::{Result, anyhow};
 use dotenvy::dotenv;
-use rust_clob_client::{ApiCreds, OrderArgs, RustClobClient, PreparedCreds};
+use pm_whale_follower::{ApiCreds, OrderArgs, RustClobClient, PreparedCreds, OrderResponse};
 use std::path::Path;
 
 const CLOB_API_BASE: &str = "https://clob.polymarket.com";
@@ -121,7 +121,7 @@ fn main() -> Result<()> {
     println!("   Body: {}\n", body_text);
 
     // Try to parse as OrderResponse
-    if let Ok(parsed) = serde_json::from_str::<rust_clob_client::OrderResponse>(&body_text) {
+    if let Ok(parsed) = serde_json::from_str::<OrderResponse>(&body_text) {
         println!("✅ Parsed OrderResponse:");
         println!("   success: {}", parsed.success);
         println!("   errorMsg: \"{}\"", parsed.error_msg);

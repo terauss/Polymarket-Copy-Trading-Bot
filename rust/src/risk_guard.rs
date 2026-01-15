@@ -1,6 +1,6 @@
 /// Risk management and safety guard for trade execution
 /// Provides protection against dangerous market conditions
-#![allow(dead_code)]
+#[allow(dead_code)]
 
 use rustc_hash::FxHashMap;
 use std::time::{Duration, Instant};
@@ -108,12 +108,12 @@ impl Default for TokenState {
 // =============================================================================
 
 pub struct RiskGuard {
-    config: CircuitBreakerConfig,
+    config: RiskGuardConfig,
     tokens: FxHashMap<String, TokenState>,
 }
 
 impl RiskGuard {
-    pub fn new(config: CircuitBreakerConfig) -> Self {
+    pub fn new(config: RiskGuardConfig) -> Self {
         Self {
             config,
             tokens: FxHashMap::default(),
@@ -122,7 +122,7 @@ impl RiskGuard {
     
     /// Hot path - no allocations if token exists
     #[inline]
-    pub fn check_fast(&mut self, token_id: &str, whale_shares: f64) -> Evaluation {
+    pub fn check_fast(&mut self, token_id: &str, whale_shares: f64) -> SafetyEvaluation {
         let now = Instant::now();
         
         // Use entry API - single lookup instead of get_mut + insert + get_mut
@@ -131,9 +131,9 @@ impl RiskGuard {
         // Check trip
         if let Some(until) = state.tripped_until {
             if now < until {
-                return Evaluation {
-                    decision: Decision::Block,
-                    reason: Reason::Tripped {
+                return SafetyEvaluation {
+                    decision: SafetyDecision::Block,
+                    reason: SafetyReason::Tripped {
                         secs_left: (until - now).as_secs() as u32,
                     },
                     consecutive_large: 0,
@@ -144,9 +144,9 @@ impl RiskGuard {
         
         // Small trade - fast path
         if whale_shares < self.config.large_trade_shares {
-            return Evaluation {
-                decision: Decision::Allow,
-                reason: Reason::SmallTrade,
+            return SafetyEvaluation {
+                decision: SafetyDecision::Allow,
+                reason: SafetyReason::SmallTrade,
                 consecutive_large: 0,
             };
         }
@@ -171,15 +171,15 @@ impl RiskGuard {
         let count = consecutive.min(255) as u8;
         
         if consecutive >= self.config.consecutive_trigger as usize {
-            Evaluation {
-                decision: Decision::FetchBook,
-                reason: Reason::SeqNeedBook { count },
+            SafetyEvaluation {
+                decision: SafetyDecision::FetchBook,
+                reason: SafetyReason::SeqNeedBook { count },
                 consecutive_large: count,
             }
         } else {
-            Evaluation {
-                decision: Decision::Allow,
-                reason: Reason::SeqOk { count },
+            SafetyEvaluation {
+                decision: SafetyDecision::Allow,
+                reason: SafetyReason::SeqOk { count },
                 consecutive_large: count,
             }
         }
@@ -191,7 +191,7 @@ impl RiskGuard {
         token_id: &str,
         consecutive: u8,
         depth_beyond_usd: f64,
-    ) -> Evaluation {
+    ) -> SafetyEvaluation {
         let depth_u16 = (depth_beyond_usd.min(65535.0)) as u16;
         
         if depth_beyond_usd < self.config.min_depth_beyond_usd {
@@ -199,18 +199,18 @@ impl RiskGuard {
             let state = self.tokens.entry(token_id.to_string()).or_default();
             state.tripped_until = Some(Instant::now() + self.config.trip_duration);
             
-            Evaluation {
-                decision: Decision::Block,
-                reason: Reason::Trap {
+            SafetyEvaluation {
+                decision: SafetyDecision::Block,
+                reason: SafetyReason::Trap {
                     seq: consecutive,
                     depth_usd: depth_u16,
                 },
                 consecutive_large: consecutive,
             }
         } else {
-            Evaluation {
-                decision: Decision::Allow,
-                reason: Reason::DepthOk {
+            SafetyEvaluation {
+                decision: SafetyDecision::Allow,
+                reason: SafetyReason::DepthOk {
                     seq: consecutive,
                     depth_usd: depth_u16,
                 },

@@ -14,6 +14,14 @@ This repository contains **two implementations** of a Polymarket copy trading bo
 
 Both bots automatically monitor and copy trades from successful Polymarket traders, executing scaled positions based on your capital and risk preferences.
 
+## ⚠️ Important Update Notice
+
+**Update Status:** The bot has been updated with Rust and Python implementations. There is no need to update if you already have a working version.
+
+**Performance:** The bot now makes transactions within 1 block with insider traders.
+
+**Latest Version:** From today, if users want to get the latest version, please contact me via Telegram: [@terauss](https://t.me/terauss)
+
 ## 🚀 Quick Start
 
 ### Choose Your Bot

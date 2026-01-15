@@ -207,7 +207,7 @@ impl Config {
     /// 
     /// Returns errors with helpful messages if required configuration is missing or invalid.
     /// For detailed setup help, see docs/02_SETUP_GUIDE.md
-    pub fn from_env() -> Result<Self> {
+    pub async fn from_env() -> Result<Self> {
         // Check if .env file exists (helpful error for beginners)
         if !Path::new(".env").exists() {
             anyhow::bail!(

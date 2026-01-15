@@ -1447,6 +1447,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bs58"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf88ba1141d185c399bee5288d850d63b8369520c1eafc32a0430b5b6c287bf4"
+dependencies = [
+ "tinyvec",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3465,6 +3474,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "pm_whale_follower"
+version = "0.1.0"
+dependencies = [
+ "alloy",
+ "anyhow",
+ "base64",
+ "bs58",
+ "chrono",
+ "criterion",
+ "dotenvy",
+ "futures",
+ "hmac",
+ "itoa",
+ "memchr",
+ "once_cell",
+ "rand 0.8.5",
+ "reqwest",
+ "rustc-hash 1.1.0",
+ "ryu",
+ "serde",
+ "serde_json",
+ "sha2",
+ "smallstr",
+ "tokio",
+ "tokio-tungstenite",
+]
+
+[[package]]
 name = "potential_utf"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4036,33 +4073,6 @@ checksum = "ab9f9ff05b63a786553a4c02943b74b34a988448671001e9a27e2f0565cc05a4"
 dependencies = [
  "libc",
  "libusb1-sys",
-]
-
-[[package]]
-name = "rust_clob_client"
-version = "0.1.0"
-dependencies = [
- "alloy",
- "anyhow",
- "base64",
- "chrono",
- "criterion",
- "dotenvy",
- "futures",
- "hmac",
- "itoa",
- "memchr",
- "once_cell",
- "rand 0.8.5",
- "reqwest",
- "rustc-hash 1.1.0",
- "ryu",
- "serde",
- "serde_json",
- "sha2",
- "smallstr",
- "tokio",
- "tokio-tungstenite",
 ]
 
 [[package]]

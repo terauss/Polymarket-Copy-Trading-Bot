@@ -24,6 +24,7 @@ ryu = "1.0"
 itoa = "1.0"
 memchr = "2"
 once_cell = "1"
+bs58 = "0.5"
 
 [dev-dependencies]
 criterion = "0.5"

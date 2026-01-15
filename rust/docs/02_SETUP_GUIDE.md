@@ -185,8 +185,8 @@ A "whale" is a successful trader you want to copy. Here's how to find one:
 
 If you have git:
 ```bash
-git clone <your-repo-url>
-cd Polymarket-Copy-Trading-Bot
+git clone https://github.com/soulcrancerdev/polymarket-kalshi-copy-trading-arbitrage-bot
+cd polymarket-kalshi-copy-trading-arbitrage-bot/rust
 ```
 
 Or download and extract the ZIP file.

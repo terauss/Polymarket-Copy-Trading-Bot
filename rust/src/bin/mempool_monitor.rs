@@ -9,7 +9,19 @@ use futures::{SinkExt, StreamExt};
 use memchr::memmem;
 use once_cell::sync::Lazy;
 use rand::Rng;
-use rust_clob_client::{ApiCreds, OrderArgs, RustClobClient, PreparedCreds, OrderResponse};
+use pm_whale_follower::{ApiCreds, OrderArgs, RustClobClient, PreparedCreds, OrderResponse};
+use pm_whale_follower::settings::{
+    Config, CLOB_API_BASE, CSV_FILE, ORDER_REPLY_TIMEOUT, WS_RECONNECT_DELAY, WS_PING_TIMEOUT,
+    BOOK_REQ_TIMEOUT, MIN_WHALE_SHARES_TO_COPY, MIN_SHARE_COUNT, MIN_CASH_VALUE,
+    SCALING_RATIO, USE_PROBABILISTIC_SIZING, RESUBMIT_PRICE_INCREMENT,
+    should_skip_trade, get_tier_params, get_resubmit_max_buffer,
+    get_max_resubmit_attempts, should_increment_price, get_gtd_expiry_secs,
+};
+use pm_whale_follower::risk_guard::{RiskGuard, RiskGuardConfig, SafetyDecision, SafetyEvaluation};
+use pm_whale_follower::models::{OrderInfo, SizeType, ResubmitRequest};
+use pm_whale_follower::tennis_markets;
+use pm_whale_follower::soccer_markets;
+use pm_whale_follower::market_cache;
 use serde_json::Value;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -22,16 +34,28 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
-use rust_clob_client::config::*;
-use rust_clob_client::circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, Decision, Side, calculate_depth_beyond};
-use rust_clob_client::types::{OrderInfo, SizeType, ResubmitRequest};
-use rust_clob_client::atp_markets;
-use rust_clob_client::ligue1_markets;
-use rust_clob_client::cache_manager;
-
 // ============================================================================
 // Mempool-specific constants (not in shared config)
 // ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Buy,
+    Sell,
+}
+
+fn calculate_depth_beyond(side: Side, levels: &[(f64, f64)], threshold: f64) -> f64 {
+    let mut total_usd = 0.0;
+    for &(price, size) in levels {
+        total_usd += price * size;
+        if side == Side::Buy && price >= threshold {
+            break;
+        } else if side == Side::Sell && price <= threshold {
+            break;
+        }
+    }
+    total_usd
+}
 
 const GAMMA_API_BASE: &str = "https://gamma-api.polymarket.com";
 
@@ -140,12 +164,12 @@ async fn main() -> Result<()> {
     ensure_csv()?;
 
     // Initialize all market caches at startup
-    cache_manager::init_caches();
+    market_cache::init_caches();
 
     // Spawn background task to periodically refresh caches
-    let _cache_refresh_handle = cache_manager::spawn_cache_refresh_task();
+    let _cache_refresh_handle = market_cache::spawn_cache_refresh_task();
 
-    let cfg = Config::from_env()?;
+    let cfg = Config::from_env().await?;
 
     let (client, creds) = build_worker_state(
         cfg.private_key.clone(),
@@ -155,7 +179,7 @@ async fn main() -> Result<()> {
     ).await?;
 
     let prepared_creds = PreparedCreds::from_api_creds(&creds)?;
-    let cb_config = cfg.circuit_breaker_config();
+    let cb_config = cfg.risk_guard_config();
 
     let (order_tx, order_rx) = mpsc::channel(1024);
     let (resubmit_tx, resubmit_rx) = mpsc::unbounded_channel::<ResubmitRequest>();
@@ -228,11 +252,11 @@ fn start_order_worker(
     creds: PreparedCreds,
     enable_trading: bool,
     mock_trading: bool,
-    cb_config: CircuitBreakerConfig,
+    cb_config: RiskGuardConfig,
     resubmit_tx: mpsc::UnboundedSender<ResubmitRequest>,
 ) {
     std::thread::spawn(move || {
-        let mut cb = CircuitBreaker::new(cb_config);
+        let mut cb = RiskGuard::new(cb_config);
         order_worker(rx, client, creds, enable_trading, mock_trading, &mut cb, resubmit_tx);
     });
 }
@@ -243,7 +267,7 @@ fn order_worker(
     creds: PreparedCreds,
     enable_trading: bool,
     mock_trading: bool,
-    cb: &mut CircuitBreaker,
+    cb: &mut RiskGuard,
     resubmit_tx: mpsc::UnboundedSender<ResubmitRequest>,
 ) {
     // Clone Arc for mutable access pattern
@@ -264,7 +288,7 @@ fn process_order(
     creds: &PreparedCreds,
     enable_trading: bool,
     mock_trading: bool,
-    cb: &mut CircuitBreaker,
+    cb: &mut RiskGuard,
     resubmit_tx: &mpsc::UnboundedSender<ResubmitRequest>,
     is_live: Option<bool>,
 ) -> String {
@@ -292,13 +316,13 @@ fn process_order(
     // Circuit breaker check
     let eval = cb.check_fast(&info.clob_token_id, whale_shares);
     match eval.decision {
-        Decision::Block => return format!("CB_BLOCKED:{}", eval.reason.as_str()),
-        Decision::FetchBook => {
+        SafetyDecision::Block => return format!("CB_BLOCKED:{}", eval.reason.as_str()),
+        SafetyDecision::FetchBook => {
             let side = if side_is_buy { Side::Buy } else { Side::Sell };
             match fetch_book_depth_blocking(client, &info.clob_token_id, side, limit_price) {
                 Ok(depth) => {
                     let final_eval = cb.check_with_book(&info.clob_token_id, eval.consecutive_large, depth);
-                    if final_eval.decision == Decision::Block {
+                    if final_eval.decision == SafetyDecision::Block {
                         return format!("CB_BLOCKED:{}", final_eval.reason.as_str());
                     }
                 }
@@ -308,7 +332,7 @@ fn process_order(
                 }
             }
         }
-        Decision::Allow => {}
+        SafetyDecision::Allow => {}
     }
 
     let (my_shares, size_type) = calculate_safe_size(whale_shares, limit_price, size_multiplier);
@@ -739,7 +763,7 @@ fn hex_decode_32(hex: &[u8], out: &mut [u8; 32]) -> bool {
 
 async fn handle_event(evt: ParsedEvent, order_engine: &OrderEngine, http_client: &reqwest::Client) {
     // Get is_live from cache first, fallback to API if cache miss
-    let is_live = match cache_manager::get_is_live(&evt.order.clob_token_id) {
+    let is_live = match market_cache::get_is_live(&evt.order.clob_token_id) {
         Some(v) => Some(v),
         None => fetch_is_live(&evt.order.clob_token_id, http_client).await,
     };
@@ -765,14 +789,14 @@ async fn handle_event(evt: ParsedEvent, order_engine: &OrderEngine, http_client:
     };
 
     // Dark green "(ATP)" indicator if this is an ATP market
-    let atp_display = if atp_markets::get_atp_token_buffer(&evt.order.clob_token_id) > 0.0 {
+    let atp_display = if tennis_markets::get_tennis_token_buffer(&evt.order.clob_token_id) > 0.0 {
         "\x1b[32m(ATP)\x1b[0m "  // Dark green
     } else {
         ""
     };
 
     // Cyan "(L1)" indicator if this is a Ligue 1 market
-    let ligue1_display = if ligue1_markets::get_ligue1_token_buffer(&evt.order.clob_token_id) > 0.0 {
+    let ligue1_display = if soccer_markets::get_soccer_token_buffer(&evt.order.clob_token_id) > 0.0 {
         "\x1b[36m(L1)\x1b[0m "  // Cyan
     } else {
         ""
@@ -1166,7 +1190,7 @@ fn submit_resubmit_order_sync(
     is_last_attempt: bool,
 ) -> anyhow::Result<(bool, String, f64)> {
     use std::time::{SystemTime, UNIX_EPOCH};
-    use rust_clob_client::config::get_gtd_expiry_secs;
+    use pm_whale_follower::settings::get_gtd_expiry_secs;
 
     let mut client = client.clone();
 
